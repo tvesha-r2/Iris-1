@@ -58,7 +58,7 @@ export const Features: React.FC = () => {
           <div className="relative z-0 w-full h-64 md:h-auto overflow-hidden perspective-[1000px] flex items-center justify-center -mr-10 -mb-10 md:mb-0 md:mr-0">
             <div className="relative w-[120%] transform rotate-y-[-15deg] rotate-x-[5deg] group-hover:rotate-y-[-10deg] transition-transform duration-700 origin-right translate-x-12">
               <div className="relative aspect-video rounded-xl overflow-hidden border border-white/20 shadow-2xl">
-                <img src="/images/astronaut_thumb.jpg" alt="Thumbnail" className="w-full h-full object-cover grayscale brightness-75" />
+                <img src="https://i.pinimg.com/736x/52/4f/c2/524fc2bb211104012b3779be34c25036.jpg" alt="Thumbnail" className="w-full h-full object-cover grayscale brightness-75" />
                 {/* CSS Heatmaps */}
                 <div className="absolute top-[20%] right-[30%] w-24 h-24 bg-red-500 rounded-full blur-[25px] mix-blend-screen opacity-90" />
                 <div className="absolute top-[30%] right-[10%] w-16 h-16 bg-yellow-400 rounded-full blur-[15px] mix-blend-screen opacity-90" />
@@ -126,12 +126,12 @@ export const Features: React.FC = () => {
           <div className="flex-1 relative">
             {/* Variant A (Back) */}
             <div className="absolute top-1/2 left-1/2 -translate-x-[60%] -translate-y-[65%] w-40 aspect-video bg-white p-1 rounded-xl shadow-lg border border-gray-200 rotate-[-5deg] opacity-60 group-hover:rotate-[-8deg] transition-transform duration-500">
-              <img src="/images/astronaut_thumb.jpg" className="w-full h-full object-cover rounded-lg" />
+              <img src="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTKsh9cdVg7XQWx1jYcYCMJB6OFJmKSTP0NsoaDNmUFJH0xlH72bkl4DMbO&s=10" className="w-full h-full object-cover rounded-lg" />
               <div className="absolute -top-3 -left-3 w-6 h-6 bg-black text-white text-xs font-bold rounded-full flex items-center justify-center border-2 border-white">A</div>
             </div>
             {/* Variant B (Front) */}
             <div className="absolute top-1/2 left-1/2 -translate-x-[40%] -translate-y-[35%] w-40 aspect-video bg-white p-1 rounded-xl shadow-2xl border border-gray-200 rotate-[4deg] group-hover:rotate-[6deg] group-hover:-translate-y-[40%] transition-transform duration-500 z-10">
-              <img src="/images/astronaut_thumb.jpg" className="w-full h-full object-cover rounded-lg" />
+              <img src="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTKsh9cdVg7XQWx1jYcYCMJB6OFJmKSTP0NsoaDNmUFJH0xlH72bkl4DMbO&s=10" className="w-full h-full object-cover rounded-lg" />
               <div className="absolute -top-3 -left-3 w-6 h-6 bg-black text-white text-xs font-bold rounded-full flex items-center justify-center border-2 border-white">B</div>
               {/* Floating Stat Card */}
               <div className="absolute -bottom-3 -right-3 bg-white border border-gray-100 rounded-xl p-2.5 shadow-xl flex flex-col items-center z-20">
@@ -245,7 +245,7 @@ export const Features: React.FC = () => {
                 {/* Video 1 (User's Thumbnail) */}
                 <div className="flex gap-3 items-start group/video">
                   <div className="relative w-40 shrink-0 aspect-video rounded-lg overflow-hidden border border-white/20 shadow-[0_0_15px_rgba(255,255,255,0.1)]">
-                    <img src="/images/astronaut_thumb.jpg" className="w-full h-full object-cover group-hover/video:scale-105 transition-transform duration-500" />
+                    <img src="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRpxJnVaCJFmqHw3K0EdbcN0z56iQ5s4NTCbRIRA59NNK79Nd0rZk2sIT8&s=10" className="w-full h-full object-cover group-hover/video:scale-105 transition-transform duration-500" />
                     <div className="absolute bottom-1 right-1 bg-black/80 text-white text-[8px] px-1 rounded">12:34</div>
                   </div>
                   <div className="space-y-1">
@@ -256,7 +256,7 @@ export const Features: React.FC = () => {
                 {/* Video 2 */}
                 <div className="flex gap-3 items-start opacity-50">
                   <div className="relative w-40 shrink-0 aspect-video rounded-lg overflow-hidden bg-[#222]">
-                    <img src="/images/about_thumb1.jpg" className="w-full h-full object-cover" />
+                    <img src="https://i.pinimg.com/736x/60/13/ff/6013ffc3177ea4ff1345df339a4b2f5c.jpg" className="w-full h-full object-cover" />
                     <div className="absolute bottom-1 right-1 bg-black/80 text-white text-[8px] px-1 rounded">10:21</div>
                   </div>
                   <div className="space-y-1">
@@ -267,7 +267,7 @@ export const Features: React.FC = () => {
                 {/* Video 3 */}
                 <div className="flex gap-3 items-start opacity-30">
                   <div className="relative w-40 shrink-0 aspect-video rounded-lg overflow-hidden bg-[#222]">
-                    <img src="/images/hero_laptop.jpg" className="w-full h-full object-cover" />
+                    <img src="https://i.pinimg.com/736x/99/d3/4f/99d34fc76703d81c867bb18a404846e4.jpg" className="w-full h-full object-cover" />
                   </div>
                   <div className="space-y-1">
                     <h4 className="text-white text-xs font-bold leading-tight">The Future of Space</h4>

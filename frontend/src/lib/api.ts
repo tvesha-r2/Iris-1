@@ -7,7 +7,7 @@
  * SECURITY: GROQ_API_KEY is never passed here — it lives server-side only.
  */
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) ?? 'http://localhost:8000';
+export const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
 
 export interface AnalysisDetections {
   texts: number;
@@ -47,14 +47,57 @@ export interface AnalysisResult {
   insights: AnalysisInsights | null;
 }
 
-/**
- * POST /api/analyze
- * Sends the selected thumbnail to the ML pipeline.
- * Returns full analysis result including optional AI insights.
- */
-export async function analyzeImage(file: File, token: string): Promise<AnalysisResult> {
+export interface StoredImage {
+  id: string;
+  url: string;
+  filename?: string | null;
+}
+
+export interface StoredThumbnail extends StoredImage {
+  overlay_url?: string | null;
+  analysis_status?: string;
+  ai_scores?: {
+    texts_detected?: number;
+    faces_detected?: number;
+    objects_detected?: number;
+  };
+  detections?: AnalysisDetections;
+  insights?: AnalysisInsights | null;
+}
+
+async function errorDetail(response: Response, fallback: string): Promise<string> {
+  const error = await response.json().catch(() => ({}));
+  return error.detail ?? `${fallback} (${response.status}). Please try again.`;
+}
+
+/** POST /api/upload — persist the original image and return its database reference. */
+export async function uploadImage(file: File, token: string): Promise<StoredImage> {
   const formData = new FormData();
   formData.append('file', file);
+
+  const response = await fetch(`${API_BASE}/api/upload`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: formData,
+  });
+  if (!response.ok) {
+    throw new Error(await errorDetail(response, 'Image storage failed'));
+  }
+
+  const storedImage = await response.json() as StoredImage;
+  if (!storedImage.id || !storedImage.url) {
+    throw new Error('Image storage failed: the server returned no stored image reference.');
+  }
+  return storedImage;
+}
+
+/**
+ * POST /api/analyze
+ * Sends the persisted thumbnail reference to the ML pipeline.
+ */
+export async function analyzeImage(thumbnailId: string, token: string): Promise<AnalysisResult> {
+  const formData = new FormData();
+  formData.append('thumbnail_id', thumbnailId);
 
   const res = await fetch(`${API_BASE}/api/analyze`, {
     method: 'POST',
@@ -66,28 +109,21 @@ export async function analyzeImage(file: File, token: string): Promise<AnalysisR
   if (res.status === 401 || res.status === 403) {
     throw new Error('Your session has expired. Please log in again.');
   }
-  if (res.status === 503) {
-    throw new Error('Analysis pipeline is starting up. Please try again in a moment.');
-  }
-  if (res.status === 422) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail ?? 'The image could not be processed. Please try a different file.');
-  }
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail ?? `Analysis failed (${res.status}). Please try again.`);
+    throw new Error(await errorDetail(res, 'Analysis failed'));
   }
 
   return res.json() as Promise<AnalysisResult>;
 }
 
 /** GET /api/thumbnails — user's analysis history */
-export async function getThumbnails(token: string) {
+export async function getThumbnails(token: string): Promise<StoredThumbnail[]> {
   const res = await fetch(`${API_BASE}/api/thumbnails`, {
     headers: { Authorization: `Bearer ${token}` },
   });
-  if (!res.ok) throw new Error('Could not load history.');
-  return res.json();
+  if (!res.ok) throw new Error(await errorDetail(res, 'Could not load saved thumbnails'));
+  const data = await res.json() as { thumbnails: StoredThumbnail[] };
+  return data.thumbnails;
 }
 
 /** POST /api/insights/{id} — generate AI insights on demand */

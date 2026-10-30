@@ -2,11 +2,19 @@ import os
 import io
 import logging
 import datetime
+from typing import List, Optional
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import Request as URLRequest, urlopen
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile
+from fastapi import FastAPI, Depends, HTTPException, status, File, UploadFile, Request, Form
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 from bson import ObjectId
 import jwt
 import cloudinary
@@ -14,7 +22,13 @@ import cloudinary.uploader
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+# Ensure backend/.env is loaded reliably regardless of current working directory
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+env_path = BACKEND_DIR / ".env"
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path, override=True)
+else:
+    load_dotenv(override=True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,26 +36,179 @@ logger = logging.getLogger(__name__)
 import api.inference_service as inference_service
 from api.gemini_insights import generate_insights
 
+MAX_IMAGE_SIZE = 20 * 1024 * 1024
+IMAGE_STORAGE_CONFIG_KEYS = (
+    "CLOUDINARY_CLOUD_NAME",
+    "CLOUDINARY_API_KEY",
+    "CLOUDINARY_API_SECRET",
+)
+
+
+def _is_placeholder(value: Optional[str]) -> bool:
+    if not value:
+        return True
+    normalized = value.strip().strip("\"'").lower()
+    return (
+        not normalized
+        or normalized.startswith(("your_", "your-", "<"))
+        or normalized in {"placeholder", "change-me", "changeme"}
+    )
+
+
+def _missing_cloudinary_settings() -> List[str]:
+    return [key for key in IMAGE_STORAGE_CONFIG_KEYS if _is_placeholder(os.getenv(key))]
+
+
+def _redact_cloudinary_credentials(message: str) -> str:
+    for key in ("CLOUDINARY_API_SECRET", "CLOUDINARY_API_KEY"):
+        value = os.getenv(key)
+        if value and not _is_placeholder(value):
+            message = message.replace(value, "[REDACTED]")
+    return message
+
+
+def _upload_cloudinary_image(image_bytes: bytes, folder: str, **options) -> dict:
+    missing_settings = _missing_cloudinary_settings()
+    if missing_settings:
+        logger.error(
+            "Image storage is not configured; missing or placeholder values for %s.",
+            ", ".join(missing_settings),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Image storage is not configured. Set "
+                f"{', '.join(missing_settings)} in backend/.env."
+            ),
+        )
+
+    try:
+        result = cloudinary.uploader.upload(
+            io.BytesIO(image_bytes),
+            folder=folder,
+            **options,
+        )
+    except Exception as exc:
+        logger.error(
+            "Cloudinary image upload failed (%s): %s",
+            type(exc).__name__,
+            _redact_cloudinary_credentials(str(exc)),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Image storage failed. Check Cloudinary credentials and account setup.",
+        ) from exc
+
+    secure_url = result.get("secure_url") if isinstance(result, dict) else None
+    if not secure_url or urlsplit(secure_url).scheme != "https":
+        logger.error("Cloudinary image upload returned no valid HTTPS secure_url.")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Image storage failed because the provider returned no secure image URL.",
+        )
+    return result
+
+
+def _download_stored_cloudinary_image(image_url: str) -> bytes:
+    parsed_url = urlsplit(image_url)
+    if parsed_url.scheme != "https" or parsed_url.hostname != "res.cloudinary.com":
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="The stored image URL is not a valid Cloudinary HTTPS URL.",
+        )
+
+    request = URLRequest(image_url, headers={"User-Agent": "Iris-image-analysis"})
+    try:
+        with urlopen(request, timeout=30) as response:
+            image_bytes = response.read(MAX_IMAGE_SIZE + 1)
+    except (HTTPError, URLError, TimeoutError) as exc:
+        logger.error(
+            "Could not retrieve stored Cloudinary image (%s): %s",
+            type(exc).__name__,
+            _redact_cloudinary_credentials(str(exc)),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not retrieve the stored image from Cloudinary.",
+        ) from exc
+
+    if not image_bytes:
+        raise HTTPException(status_code=422, detail="The stored image is empty.")
+    if len(image_bytes) > MAX_IMAGE_SIZE:
+        raise HTTPException(status_code=413, detail="The stored image exceeds the 20 MB limit.")
+    return image_bytes
+
+
+def _insert_thumbnail(user_id: str, filename: Optional[str], upload_result: dict):
+    return thumbnails_col.insert_one({
+        "user_id": user_id,
+        "filename": filename,
+        "cloudinary_url": upload_result["secure_url"],
+        "cloudinary_public_id": upload_result.get("public_id"),
+        "overlay_url": None,
+        "created_at": datetime.datetime.utcnow(),
+        "ai_scores": {},
+        "analysis_status": "uploaded",
+    }).inserted_id
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load ML models once at startup; release nothing (models live for process lifetime)."""
+    """Run startup checks: test MongoDB connection and initialize ML models if present."""
+    missing_storage_settings = _missing_cloudinary_settings()
+    if missing_storage_settings:
+        logger.error(
+            "Image storage is not configured; missing or placeholder values for %s.",
+            ", ".join(missing_storage_settings),
+        )
+
+    # Test MongoDB connection at startup
+    try:
+        client.admin.command("ping")
+        logger.info("MongoDB connected successfully.")
+    except Exception as exc:
+        logger.warning(
+            f"MongoDB connection test failed at startup: {exc}. "
+            "Please check MONGO_URI, database user credentials, and Atlas Network Access (IP whitelist)."
+        )
+
+    # Attempt to load ML models (lifespan survives if models are not yet placed)
     try:
         inference_service.initialize()
         logger.info("ML models loaded successfully at startup.")
     except Exception as exc:
-        logger.error(f"ML model initialisation failed: {exc}")
-        # Server still starts; /api/analyze will return 503 if models are missing.
+        logger.warning(
+            f"ML model initialisation skipped or failed: {exc}. "
+            "Server will start; ML inference endpoints will return 503 until model checkpoints are provided."
+        )
     yield
 
 app = FastAPI(lifespan=lifespan)
 
+# CORS Configuration
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
+if allowed_origins_env:
+    allowed_origins = [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
+else:
+    allowed_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(PyMongoError)
+async def pymongo_exception_handler(request: Request, exc: PyMongoError):
+    logger.error(f"Database error on {request.method} {request.url.path}: {type(exc).__name__}: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": "Database service unavailable. Please check MongoDB connection and credentials."},
+    )
 
 # Config
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -55,8 +222,15 @@ cloudinary.config(
     api_secret=os.getenv("CLOUDINARY_API_SECRET")
 )
 
-# DB
-client = MongoClient(MONGO_URI)
+# DB - Optional certifi CA bundle support for secure Atlas TLS verification
+tls_kwargs = {}
+try:
+    import certifi
+    tls_kwargs["tlsCAFile"] = certifi.where()
+except ImportError:
+    pass
+
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, **tls_kwargs)
 db = client.thumbheap
 users_col = db.users
 thumbnails_col = db.thumbnails
@@ -95,98 +269,156 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     except jwt.PyJWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-@app.post("/auth/register")
+@app.post("/auth/register", status_code=status.HTTP_201_CREATED)
 def register(user: UserCreate):
-    if users_col.find_one({"email": user.email}):
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
-    user_id = users_col.insert_one({
-        "email": user.email,
-        "password": get_password_hash(user.password),
-        "created_at": datetime.datetime.utcnow()
-    }).inserted_id
-    
-    return {"message": "User created", "user_id": str(user_id)}
+    try:
+        if users_col.find_one({"email": user.email}):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered")
+        
+        user_id = users_col.insert_one({
+            "email": user.email,
+            "password": get_password_hash(user.password),
+            "created_at": datetime.datetime.utcnow()
+        }).inserted_id
+        
+        return {"message": "User created", "user_id": str(user_id)}
+    except HTTPException:
+        raise
+    except PyMongoError as exc:
+        logger.error(f"MongoDB error during registration: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database service unavailable. Please check your MongoDB connection and credentials."
+        )
+    except Exception as exc:
+        logger.error(f"Unexpected error during registration: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Registration failed due to an internal server error."
+        )
 
 @app.post("/auth/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = users_col.find_one({"email": form_data.username})
-    if not user or not verify_password(form_data.password, user["password"]):
-        raise HTTPException(status_code=400, detail="Incorrect email or password")
-    
-    access_token = create_access_token(data={"sub": str(user["_id"])})
-    return {"access_token": access_token, "token_type": "bearer"}
+    try:
+        user = users_col.find_one({"email": form_data.username})
+        if not user or not verify_password(form_data.password, user["password"]):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Incorrect email or password")
+        
+        access_token = create_access_token(data={"sub": str(user["_id"])})
+        return {"access_token": access_token, "token_type": "bearer"}
+    except HTTPException:
+        raise
+    except PyMongoError as exc:
+        logger.error(f"MongoDB error during login: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database service unavailable. Please check your MongoDB connection and credentials."
+        )
 
 @app.post("/api/upload")
 async def upload_image(file: UploadFile = File(...), user_id: str = Depends(get_current_user)):
-    """Original upload endpoint — stores raw thumbnail in Cloudinary + MongoDB unchanged."""
-    try:
-        # Upload the file to Cloudinary in the "Thumbheat" folder
-        result = cloudinary.uploader.upload(file.file, folder="Thumbheat")
-        secure_url = result.get("secure_url")
-        
-        doc_id = thumbnails_col.insert_one({
-            "user_id": user_id,
-            "cloudinary_url": secure_url,
-            "filename": file.filename,
-            "created_at": datetime.datetime.utcnow(),
-            "ai_scores": {}
-        }).inserted_id
-        
-        return {"id": str(doc_id), "url": secure_url}
-    except Exception as e:
-        logger.error(f"Upload error: {e}")
-        raise HTTPException(status_code=500, detail="Upload failed.")
+    """Persist an original thumbnail to Cloudinary and its reference to MongoDB."""
+    image_bytes = await file.read(MAX_IMAGE_SIZE + 1)
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Empty file received.")
+    if len(image_bytes) > MAX_IMAGE_SIZE:
+        raise HTTPException(status_code=413, detail="Image exceeds the 20 MB limit.")
+
+    upload_result = await run_in_threadpool(
+        _upload_cloudinary_image,
+        image_bytes,
+        "Thumbheat",
+    )
+    doc_id = _insert_thumbnail(user_id, file.filename, upload_result)
+    logger.info("Stored thumbnail %s for user %s.", doc_id, user_id)
+    return {"id": str(doc_id), "url": upload_result["secure_url"]}
 
 
 @app.post("/api/analyze")
-async def analyze_thumbnail(file: UploadFile = File(...), user_id: str = Depends(get_current_user)):
+async def analyze_thumbnail(
+    thumbnail_id: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    user_id: str = Depends(get_current_user),
+):
     """
-    ML inference endpoint.
-
-    1. Uploads the original thumbnail to Cloudinary (reuses existing client).
-    2. Runs the full 8-channel Fusion inference pipeline.
-    3. Uploads the attention-heatmap overlay to Cloudinary.
-    4. Stores all metadata in the existing thumbnails collection (reuses existing MongoDB connection).
-    5. Returns URLs and detection counts to the frontend.
+    Analyze a previously stored thumbnail by ID. The file field remains supported
+    for existing clients and is persisted before inference.
     """
-    # Read file bytes once; UploadFile stream is single-use
-    image_bytes = await file.read()
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="Empty file received.")
-
-    # ── Upload original thumbnail ────────────────────────────────────────────
-    try:
-        orig_result = cloudinary.uploader.upload(
-            io.BytesIO(image_bytes), folder="Thumbheat"
+    if bool(thumbnail_id) == bool(file):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one stored thumbnail_id or an image file.",
         )
-        original_url = orig_result.get("secure_url")
-    except Exception as exc:
-        logger.error(f"Cloudinary original upload failed: {exc}")
-        raise HTTPException(status_code=502, detail="Image storage failed.")
+
+    if thumbnail_id:
+        if not ObjectId.is_valid(thumbnail_id):
+            raise HTTPException(status_code=400, detail="Invalid thumbnail ID.")
+        stored_doc_id = ObjectId(thumbnail_id)
+        stored_doc = thumbnails_col.find_one({
+            "_id": stored_doc_id,
+            "user_id": user_id,
+        })
+        if not stored_doc:
+            raise HTTPException(status_code=404, detail="Stored thumbnail not found.")
+        original_url = stored_doc.get("cloudinary_url")
+        if not original_url:
+            raise HTTPException(status_code=500, detail="Stored thumbnail has no image URL.")
+        image_bytes = await run_in_threadpool(_download_stored_cloudinary_image, original_url)
+    else:
+        image_bytes = await file.read(MAX_IMAGE_SIZE + 1)
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="Empty file received.")
+        if len(image_bytes) > MAX_IMAGE_SIZE:
+            raise HTTPException(status_code=413, detail="Image exceeds the 20 MB limit.")
+
+        upload_result = await run_in_threadpool(
+            _upload_cloudinary_image,
+            image_bytes,
+            "Thumbheat",
+        )
+        original_url = upload_result["secure_url"]
+        filename = file.filename
+        stored_doc_id = _insert_thumbnail(user_id, filename, upload_result)
 
     # ── Run ML inference ────────────────────────────────────────────────────
     try:
         result = inference_service.run_inference(image_bytes)
     except ValueError as exc:
+        thumbnails_col.update_one(
+            {"_id": stored_doc_id, "user_id": user_id},
+            {"$set": {"analysis_status": "failed"}},
+        )
         raise HTTPException(status_code=422, detail=str(exc))
     except RuntimeError as exc:
         logger.error(f"Inference error: {exc}")
+        thumbnails_col.update_one(
+            {"_id": stored_doc_id, "user_id": user_id},
+            {"$set": {"analysis_status": "failed"}},
+        )
         raise HTTPException(status_code=503, detail="Inference pipeline unavailable.")
     except Exception as exc:
         logger.error(f"Unexpected inference error: {exc}")
+        thumbnails_col.update_one(
+            {"_id": stored_doc_id, "user_id": user_id},
+            {"$set": {"analysis_status": "failed"}},
+        )
         raise HTTPException(status_code=500, detail="Inference failed.")
 
     # ── Upload heatmap overlay ───────────────────────────────────────────────
     try:
-        overlay_result = cloudinary.uploader.upload(
-            io.BytesIO(result["overlay_png"]),
-            folder="Thumbheat/overlays",
+        overlay_result = await run_in_threadpool(
+            _upload_cloudinary_image,
+            result["overlay_png"],
+            "Thumbheat/overlays",
             format="png",
         )
         overlay_url = overlay_result.get("secure_url")
     except Exception as exc:
-        logger.error(f"Cloudinary overlay upload failed: {exc}")
+        logger.error(
+            "Cloudinary overlay upload failed (%s): %s",
+            type(exc).__name__,
+            _redact_cloudinary_credentials(str(exc)),
+        )
         overlay_url = None   # Non-fatal; numeric result is still valid
 
     # ── Calculate Real Heatmap Stats ─────────────────────────────────────────
@@ -203,15 +435,12 @@ async def analyze_thumbnail(file: UploadFile = File(...), user_id: str = Depends
         except Exception:
             pass
 
-    # ── Persist metadata in existing thumbnails collection ──────────────────
+    # ── Persist metadata on the already-stored thumbnail ────────────────────
     detections = result["detections"]
-    try:
-        doc_id = thumbnails_col.insert_one({
-            "user_id":          user_id,
-            "filename":         file.filename,
-            "cloudinary_url":   original_url,
+    update_result = thumbnails_col.update_one(
+        {"_id": stored_doc_id, "user_id": user_id},
+        {"$set": {
             "overlay_url":      overlay_url,
-            "created_at":       datetime.datetime.utcnow(),
             "ai_scores": {
                 "texts_detected":   detections["texts"],
                 "faces_detected":   detections["faces"],
@@ -221,17 +450,19 @@ async def analyze_thumbnail(file: UploadFile = File(...), user_id: str = Depends
                 "mean": attn_mean,
                 "concentration": attn_concentration,
                 "peak": attn_peak,
-            }
-        }).inserted_id
-    except Exception as exc:
-        logger.error(f"MongoDB insert failed: {exc}")
-        raise HTTPException(status_code=500, detail="Result storage failed.")
+            },
+            "analysis_status": "completed",
+        }},
+    )
+    if update_result.matched_count != 1:
+        logger.error("Analysis result could not be saved for thumbnail %s.", stored_doc_id)
+        raise HTTPException(status_code=500, detail="Analysis result could not be saved.")
 
-    # AI insights are no longer generated automatically; they are triggered on-demand via a separate endpoint.
+    # AI insights are triggered on-demand via a separate endpoint.
     insights = None
 
     return {
-        "id":          str(doc_id),
+        "id":          str(stored_doc_id),
         "url":         original_url,
         "overlay_url": overlay_url,
         "detections":  detections,
@@ -242,7 +473,10 @@ async def analyze_thumbnail(file: UploadFile = File(...), user_id: str = Depends
 def get_thumbnails(user_id: str = Depends(get_current_user)):
     docs = list(thumbnails_col.find({"user_id": user_id}).sort("created_at", -1))
     for doc in docs:
-        doc["_id"] = str(doc["_id"])
+        doc_id = str(doc["_id"])
+        doc["_id"] = doc_id
+        doc["id"] = doc_id
+        doc["url"] = doc.get("cloudinary_url")
     return {"thumbnails": docs}
 
 @app.post("/api/insights/{thumbnail_id}")
@@ -259,7 +493,6 @@ def generate_insights_for_thumbnail(thumbnail_id: str, user_id: str = Depends(ge
             "objects": doc.get("ai_scores", {}).get("objects_detected", 0),
         }
         
-        # Call groq_insights with the image URLs and pre-calculated stats
         insights = generate_insights(
             detections=detections,
             original_url=doc.get("cloudinary_url"),
@@ -268,7 +501,6 @@ def generate_insights_for_thumbnail(thumbnail_id: str, user_id: str = Depends(ge
         )
         
         if insights:
-            # Optionally save insights to DB for future retrieval
             thumbnails_col.update_one({"_id": ObjectId(thumbnail_id)}, {"$set": {"insights": insights}})
             return {"insights": insights}
         else:
@@ -283,35 +515,27 @@ def generate_insights_for_thumbnail(thumbnail_id: str, user_id: str = Depends(ge
 
 # ── Creator Profile ──────────────────────────────────────────────────────────
 
-from typing import List, Optional
-
 class CreatorProfile(BaseModel):
-    # Channel identity
     channel_name: Optional[str] = None
     channel_url: Optional[str] = None
 
-    # Content type
-    video_category: Optional[str] = None          # e.g. "Education", "Gaming", "Vlog"
-    video_types: Optional[List[str]] = []         # e.g. ["Tutorials", "Reviews", "Shorts"]
-    niche_description: Optional[str] = None       # free-text niche
+    video_category: Optional[str] = None
+    video_types: Optional[List[str]] = []
+    niche_description: Optional[str] = None
 
-    # Audience
-    target_age_groups: Optional[List[str]] = []   # e.g. ["13-17", "18-24", "25-34"]
-    target_genders: Optional[List[str]] = []      # e.g. ["Male", "Female", "All"]
-    audience_regions: Optional[List[str]] = []    # e.g. ["India", "USA", "Global"]
+    target_age_groups: Optional[List[str]] = []
+    target_genders: Optional[List[str]] = []
+    audience_regions: Optional[List[str]] = []
 
-    # Channel stats & habits
-    channel_size: Optional[str] = None            # e.g. "<1K", "1K-10K", "10K-100K", "100K+"
-    upload_frequency: Optional[str] = None        # e.g. "Daily", "Weekly", "Bi-weekly"
-    avg_video_length: Optional[str] = None        # e.g. "<5 min", "5-15 min", "15-30 min", "30+ min"
+    channel_size: Optional[str] = None
+    upload_frequency: Optional[str] = None
+    avg_video_length: Optional[str] = None
 
-    # Goals
-    primary_goal: Optional[str] = None            # e.g. "Grow subscribers", "Monetise", "Brand awareness"
-    biggest_challenge: Optional[str] = None       # e.g. "Low CTR", "Watch time", "Thumbnail design"
+    primary_goal: Optional[str] = None
+    biggest_challenge: Optional[str] = None
 
-    # Thumbnail style preferences
-    thumbnail_style: Optional[List[str]] = []     # e.g. ["Face-forward", "Text-heavy", "Minimalist"]
-    color_preference: Optional[str] = None        # e.g. "Bright", "Dark", "Neutral"
+    thumbnail_style: Optional[List[str]] = []
+    color_preference: Optional[str] = None
 
 
 @app.get("/api/profile")

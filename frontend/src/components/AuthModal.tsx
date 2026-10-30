@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { X, Lock, Mail, Loader2, Sparkles } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { API_BASE } from '../lib/api';
 
 interface AuthModalProps {
   isOpen: boolean;
@@ -22,9 +23,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
     setLoading(true);
     setError('');
 
-    const endpoint = isLogin ? 'login' : 'register';
-    const baseUrl = 'http://localhost:8000'; // Make sure backend runs on 8000
-
     try {
       let response;
       if (isLogin) {
@@ -33,7 +31,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
         formData.append('username', email);
         formData.append('password', password);
 
-        response = await fetch(`${baseUrl}/auth/login`, {
+        response = await fetch(`${API_BASE}/auth/login`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
@@ -41,7 +39,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
           body: formData.toString(),
         });
       } else {
-        response = await fetch(`${baseUrl}/auth/register`, {
+        response = await fetch(`${API_BASE}/auth/register`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',

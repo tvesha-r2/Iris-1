@@ -4,6 +4,9 @@ import { AppNavbar } from '../components/AppNavbar';
 import { Upload, X, Activity, MousePointer2, Smartphone, Monitor, ChevronRight, Zap, Target } from 'lucide-react';
 import gsap from 'gsap';
 import { ScrollTrigger } from 'gsap/ScrollTrigger';
+import { analyzeImage, uploadImage } from '../lib/api';
+import type { AnalysisResult, StoredImage } from '../lib/api';
+import { useAuth } from '../context/AuthContext';
 
 gsap.registerPlugin(ScrollTrigger);
 
@@ -12,33 +15,33 @@ type FeedScale = 'desktop' | 'mobile';
 
 interface Variant {
   id: 'A' | 'B';
-  image: string;
-  score: number;
-  face: number;
-  title: number;
-  subject: number;
-  bg: number;
+  file: File;
+  previewUrl: string;
+  storedImage?: StoredImage;
+  analysis?: AnalysisResult;
 }
-
-const mockVariants: Record<string, Variant> = {
-  A: { id: 'A', image: 'https://images.unsplash.com/photo-1611162617474-5b21e879e113?ixlib=rb-4.0.3&auto=format&fit=crop&w=1280&q=80', score: 78, face: 41, title: 28, subject: 19, bg: 7 },
-  B: { id: 'B', image: 'https://images.unsplash.com/photo-1611162617474-5b21e879e113?ixlib=rb-4.0.3&auto=format&fit=crop&w=1280&q=80&grayscale=true', score: 71, face: 32, title: 34, subject: 22, bg: 8 },
-};
 
 export const Compare: React.FC = () => {
   const navigate = useNavigate();
   const pageRef = useRef<HTMLDivElement>(null);
+  const previewUrlsRef = useRef(new Set<string>());
+  const { token } = useAuth();
 
-  const [variants, setVariants] = useState<Partial<Record<'A' | 'B', string>>>({});
+  const [variants, setVariants] = useState<Partial<Record<'A' | 'B', Variant>>>({});
   const [isComparing, setIsComparing] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [viewMode, setViewMode] = useState<ViewMode>('heatmap');
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<ViewMode>('original');
   const [feedScale, setFeedScale] = useState<FeedScale>('desktop');
   const [activeFeedVariant, setActiveFeedVariant] = useState<'A' | 'B'>('A');
   const [showFeedHeatmap, setShowFeedHeatmap] = useState(false);
 
   const fileInputRefA = useRef<HTMLInputElement>(null);
   const fileInputRefB = useRef<HTMLInputElement>(null);
+
+  useEffect(() => () => {
+    previewUrlsRef.current.forEach(url => URL.revokeObjectURL(url));
+  }, []);
 
   useEffect(() => {
     const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -137,8 +140,25 @@ export const Compare: React.FC = () => {
   const handleFileChange = (id: 'A' | 'B', e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      const url = URL.createObjectURL(file);
-      setVariants(prev => ({ ...prev, [id]: url }));
+      if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) {
+        setAnalysisError('Please choose a PNG, JPG, or WEBP image.');
+      } else if (file.size > 20 * 1024 * 1024) {
+        setAnalysisError('Each image must be under 20 MB.');
+      } else {
+        const existing = variants[id];
+        if (existing) {
+          URL.revokeObjectURL(existing.previewUrl);
+          previewUrlsRef.current.delete(existing.previewUrl);
+        }
+        const previewUrl = URL.createObjectURL(file);
+        previewUrlsRef.current.add(previewUrl);
+        setVariants(prev => ({
+          ...prev,
+          [id]: { id, file, previewUrl },
+        }));
+        setAnalysisError(null);
+        setIsComparing(false);
+      }
     }
     // reset input value so the same file can be selected again
     e.target.value = '';
@@ -146,36 +166,66 @@ export const Compare: React.FC = () => {
 
   const removeVariant = (id: 'A' | 'B', e: React.MouseEvent) => {
     e.stopPropagation();
+    if (isAnalyzing) return;
     setVariants(prev => {
       const newVars = { ...prev };
-      if (newVars[id] && newVars[id]!.startsWith('blob:')) {
-        URL.revokeObjectURL(newVars[id]!);
+      if (newVars[id]) {
+        URL.revokeObjectURL(newVars[id]!.previewUrl);
+        previewUrlsRef.current.delete(newVars[id]!.previewUrl);
       }
       delete newVars[id];
       return newVars;
     });
+    setIsComparing(false);
+    setAnalysisError(null);
   };
 
-  const startComparison = () => {
-    if (!variants.A || !variants.B) return;
+  const startComparison = async () => {
+    const selectedVariants = variants;
+    if (!selectedVariants.A || !selectedVariants.B) return;
+    if (!token) {
+      navigate('/login');
+      return;
+    }
 
+    setAnalysisError(null);
     setIsAnalyzing(true);
-
-    // Fake analysis delay
-    setTimeout(() => {
-      const tl = gsap.timeline({
-        onComplete: () => {
-          setIsAnalyzing(false);
-          setIsComparing(true);
-          window.scrollTo({ top: 0, behavior: 'smooth' });
+    try {
+      for (const id of ['A', 'B'] as const) {
+        const variant = selectedVariants[id]!;
+        const storedImage = variant.storedImage ?? await uploadImage(variant.file, token);
+        if (!variant.storedImage) {
+          setVariants(prev => ({
+            ...prev,
+            [id]: { ...prev[id]!, storedImage },
+          }));
         }
-      });
-      tl.to('.upload-section', { opacity: 0, y: -20, duration: 0.5 });
-    }, 2000);
+
+        const analysis = variant.analysis ?? await analyzeImage(storedImage.id, token);
+        setVariants(prev => ({
+          ...prev,
+          [id]: { ...prev[id]!, storedImage, analysis },
+        }));
+      }
+
+      setIsComparing(true);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (error) {
+      setAnalysisError(error instanceof Error ? error.message : 'Thumbnail comparison failed. Please try again.');
+    } finally {
+      setIsAnalyzing(false);
+    }
   };
 
   const canCompare = variants.A && variants.B;
   const activeKeys = Object.keys(variants).sort() as ('A' | 'B')[];
+  const canShowHeatmaps = activeKeys.length === 2
+    && activeKeys.every(id => Boolean(variants[id]?.analysis?.overlay_url));
+  const countFor = (id: 'A' | 'B', category: keyof AnalysisResult['detections']) =>
+    variants[id]?.analysis?.detections[category] ?? 0;
+  const totalFor = (id: 'A' | 'B') =>
+    countFor(id, 'faces') + countFor(id, 'texts') + countFor(id, 'objects');
+  const activeFeedAnalysis = variants[activeFeedVariant]?.analysis;
 
   const renderUploadSlot = (id: 'A' | 'B', title: string, isOptional: boolean = false) => {
     const hasImage = !!variants[id];
@@ -183,23 +233,24 @@ export const Compare: React.FC = () => {
     return (
       <div
         className={`upload-slot relative aspect-video border-2 ${hasImage ? 'border-[#8B5CF6] border-solid' : 'border-dashed border-[#E6E4DE] hover:border-[#D5D3CC]'} rounded-3xl transition-all duration-300 flex flex-col items-center justify-center overflow-hidden bg-white group cursor-pointer`}
-        onClick={() => !hasImage && handleUploadClick(id)}
+        onClick={() => !isAnalyzing && !hasImage && handleUploadClick(id)}
       >
         <input 
           type="file" 
           ref={id === 'A' ? fileInputRefA : fileInputRefB} 
           className="hidden" 
           accept="image/*" 
+          disabled={isAnalyzing}
           onChange={(e) => handleFileChange(id, e)} 
         />
         {hasImage ? (
           <>
-            <img src={variants[id]} alt={title} className="w-full h-full object-cover" />
+            <img src={variants[id]!.previewUrl} alt={title} className="w-full h-full object-cover" />
             <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-center items-center gap-3 backdrop-blur-[2px]">
               <span className="text-white font-bold tracking-wider">{title}</span>
               <div className="flex gap-2">
-                <button onClick={(e) => { e.stopPropagation(); handleUploadClick(id); }} className="px-4 py-2 bg-white/20 hover:bg-white/30 text-white rounded-lg text-sm font-semibold backdrop-blur-md transition-colors">Replace</button>
-                <button onClick={(e) => removeVariant(id, e)} className="p-2 bg-red-500/80 hover:bg-red-500 text-white rounded-lg transition-colors"><X className="w-5 h-5" /></button>
+                <button disabled={isAnalyzing} onClick={(e) => { e.stopPropagation(); handleUploadClick(id); }} className="px-4 py-2 bg-white/20 hover:bg-white/30 text-white rounded-lg text-sm font-semibold backdrop-blur-md transition-colors">Replace</button>
+                <button disabled={isAnalyzing} onClick={(e) => removeVariant(id, e)} className="p-2 bg-red-500/80 hover:bg-red-500 text-white rounded-lg transition-colors"><X className="w-5 h-5" /></button>
               </div>
             </div>
             <div className="absolute top-4 left-4 bg-black/60 backdrop-blur-md px-3 py-1 rounded-lg text-white text-xs font-bold uppercase tracking-wider">{title}</div>
@@ -222,58 +273,40 @@ export const Compare: React.FC = () => {
   };
 
   const renderVariantAnalysis = (id: 'A' | 'B') => {
-    const data = mockVariants[id];
-    if (!data || !variants[id]) return null;
+    const result = variants[id]?.analysis;
+    if (!result) return null;
+    const total = totalFor(id);
+    const displayUrl = viewMode === 'heatmap' && result.overlay_url
+      ? result.overlay_url
+      : result.url;
 
     return (
       <div key={id} className="battle-card bg-white border border-[#E6E4DE] rounded-3xl p-5 shadow-xl shadow-black/5 flex flex-col w-full max-w-2xl mx-auto">
         <div className="flex justify-between items-center mb-4 px-1">
           <span className="text-sm font-bold text-[#121214] bg-[#FAF9F5] px-3 py-1 rounded-md border border-[#E6E4DE]">Variant {id}</span>
           <div className="flex items-center gap-2">
-            <span className="text-xs font-bold text-[#4A4950] uppercase tracking-wide">Score</span>
-            <span className="text-xl font-black text-[#8B5CF6]">{data.score}</span>
+            <span className="text-xs font-bold text-[#4A4950] uppercase tracking-wide">Elements detected</span>
+            <span className="text-xl font-black text-[#8B5CF6]">{total}</span>
           </div>
         </div>
 
         <div className="relative rounded-2xl overflow-hidden bg-[#121214] aspect-video flex items-center justify-center mb-6">
-          <img src={data.image} alt={`Variant ${id}`} className={`battle-thumbnail w-full h-full object-cover ${id === 'B' ? 'grayscale' : ''}`} />
-
-          {/* Heatmap Overlay */}
-          {viewMode === 'heatmap' && (
-            <div className="battle-heatmap absolute inset-0 mix-blend-screen opacity-90 transition-opacity duration-500" style={{ backgroundImage: `radial-gradient(circle at ${id === 'A' ? '40% 30%' : '50% 20%'}, rgba(239,68,68,0.8) 0%, rgba(249,115,22,0.6) 20%, transparent 60%), radial-gradient(circle at ${id === 'A' ? '70% 50%' : '60% 60%'}, rgba(245,158,11,0.7) 0%, rgba(139,92,246,0.5) 30%, transparent 70%)` }}></div>
-          )}
-
-          {/* Scan Path Overlay */}
+          <img src={displayUrl} alt={`Variant ${id} ${viewMode}`} className="battle-thumbnail w-full h-full object-cover" />
           {viewMode === 'scan' && (
-            <div className="battle-scan-path absolute inset-0">
-              <div className={`absolute w-7 h-7 bg-[#8B5CF6] text-white rounded-full flex items-center justify-center font-bold text-xs shadow-xl z-10 border-2 border-white ${id === 'A' ? 'top-[30%] left-[40%]' : 'top-[20%] left-[50%]'}`}>1</div>
-              <div className={`absolute w-7 h-7 bg-[#8B5CF6] text-white rounded-full flex items-center justify-center font-bold text-xs shadow-xl z-10 border-2 border-white ${id === 'A' ? 'top-[50%] left-[70%]' : 'top-[60%] left-[60%]'}`}>2</div>
-              <div className={`absolute w-7 h-7 bg-[#8B5CF6] text-white rounded-full flex items-center justify-center font-bold text-xs shadow-xl z-10 border-2 border-white ${id === 'A' ? 'top-[70%] left-[20%]' : 'top-[80%] left-[30%]'}`}>3</div>
-              <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ zIndex: 5 }}>
-                {id === 'A' ? (
-                  <>
-                    <path d="M 40% 30% Q 55% 20% 70% 50%" fill="none" stroke="rgba(255,255,255,0.8)" strokeWidth="2.5" strokeDasharray="6 6" />
-                    <path d="M 70% 50% Q 45% 80% 20% 70%" fill="none" stroke="rgba(255,255,255,0.8)" strokeWidth="2.5" strokeDasharray="6 6" />
-                  </>
-                ) : (
-                  <>
-                    <path d="M 50% 20% Q 65% 30% 60% 60%" fill="none" stroke="rgba(255,255,255,0.8)" strokeWidth="2.5" strokeDasharray="6 6" />
-                    <path d="M 60% 60% Q 45% 80% 30% 80%" fill="none" stroke="rgba(255,255,255,0.8)" strokeWidth="2.5" strokeDasharray="6 6" />
-                  </>
-                )}
-              </svg>
+            <div className="absolute inset-x-0 bottom-0 bg-black/70 px-4 py-2 text-center text-xs text-white">
+              Scan-path data is not provided by the current analysis.
             </div>
           )}
         </div>
 
         <div className="grid grid-cols-2 gap-3">
           <div className="battle-metric bg-[#FAF9F5] p-3 rounded-xl border border-[#E6E4DE]">
-            <div className="text-[10px] font-bold text-[#8F8D98] uppercase tracking-wider mb-1">Face Attention</div>
-            <div className="text-lg font-bold text-[#121214]">{data.face}%</div>
+            <div className="text-[10px] font-bold text-[#8F8D98] uppercase tracking-wider mb-1">Faces detected</div>
+            <div className="text-lg font-bold text-[#121214]">{result.detections.faces}</div>
           </div>
           <div className="battle-metric bg-[#FAF9F5] p-3 rounded-xl border border-[#E6E4DE]">
-            <div className="text-[10px] font-bold text-[#8F8D98] uppercase tracking-wider mb-1">Text Attention</div>
-            <div className="text-lg font-bold text-[#121214]">{data.title}%</div>
+            <div className="text-[10px] font-bold text-[#8F8D98] uppercase tracking-wider mb-1">Text regions detected</div>
+            <div className="text-lg font-bold text-[#121214]">{result.detections.texts}</div>
           </div>
         </div>
       </div>
@@ -316,7 +349,10 @@ export const Compare: React.FC = () => {
                 <ChevronRight className="w-5 h-5" />
               </button>
             )}
-            {!canCompare && !isAnalyzing && (
+            {analysisError && (
+              <p role="alert" className="mt-4 text-sm font-medium text-red-600">{analysisError}</p>
+            )}
+            {!canCompare && !isAnalyzing && !analysisError && (
               <p className="mt-4 text-sm font-medium text-[#8F8D98]">Upload at least two variants to begin comparison.</p>
             )}
           </div>
@@ -330,11 +366,16 @@ export const Compare: React.FC = () => {
             <h2 className="text-3xl font-bold tracking-tight text-[#121214] mb-4">A/B Thumbnail Battle</h2>
             <div className="flex items-center justify-center gap-2 p-1 bg-white border border-[#E6E4DE] rounded-xl shadow-sm inline-flex mx-auto">
               <button onClick={() => setViewMode('original')} className={`px-4 py-1.5 text-sm font-semibold rounded-lg transition-colors ${viewMode === 'original' ? 'bg-[#FAF9F5] text-[#121214] shadow-sm' : 'text-[#4A4950] hover:text-[#121214]'}`}>Original</button>
-              <button onClick={() => setViewMode('heatmap')} className={`px-4 py-1.5 text-sm font-semibold rounded-lg transition-colors flex items-center gap-1.5 ${viewMode === 'heatmap' ? 'bg-[#8B5CF6] text-white shadow-sm' : 'text-[#4A4950] hover:text-[#121214]'}`}><Activity className="w-4 h-4" /> Heatmap</button>
+              <button
+                onClick={() => setViewMode('heatmap')}
+                disabled={!canShowHeatmaps}
+                title={!canShowHeatmaps ? 'Heatmaps are unavailable for one or more variants.' : 'Show generated heatmaps'}
+                className={`px-4 py-1.5 text-sm font-semibold rounded-lg transition-colors flex items-center gap-1.5 disabled:opacity-40 disabled:cursor-not-allowed ${viewMode === 'heatmap' ? 'bg-[#8B5CF6] text-white shadow-sm' : 'text-[#4A4950] hover:text-[#121214]'}`}
+              ><Activity className="w-4 h-4" /> Heatmap</button>
               <button onClick={() => setViewMode('scan')} className={`px-4 py-1.5 text-sm font-semibold rounded-lg transition-colors flex items-center gap-1.5 ${viewMode === 'scan' ? 'bg-[#121214] text-white shadow-sm' : 'text-[#4A4950] hover:text-[#121214]'}`}><MousePointer2 className="w-4 h-4" /> Scan Path</button>
             </div>
             {viewMode === 'heatmap' && <p className="mt-4 text-xs font-bold text-[#8F8D98] uppercase tracking-wider">Predicted visual attention</p>}
-            {viewMode === 'scan' && <p className="mt-4 text-xs font-bold text-[#8F8D98] uppercase tracking-wider">Predicted attention order</p>}
+            {viewMode === 'scan' && <p className="mt-4 text-xs font-bold text-[#8F8D98] uppercase tracking-wider">Scan-path data is unavailable for this analysis</p>}
           </div>
 
           <div className="battle-section flex flex-col lg:flex-row justify-center gap-8 mb-20 overflow-x-auto pb-8 snap-x">
@@ -343,7 +384,7 @@ export const Compare: React.FC = () => {
 
           {/* DISTRIBUTION COMPARISON */}
           <div className="comparison-chart bg-white border border-[#E6E4DE] rounded-3xl p-8 lg:p-12 shadow-sm max-w-5xl mx-auto mb-20">
-            <h3 className="text-sm font-bold text-[#4A4950] tracking-wide uppercase mb-10 text-center">Estimated Attention Distribution</h3>
+            <h3 className="text-sm font-bold text-[#4A4950] tracking-wide uppercase mb-10 text-center">Detected Elements by Category</h3>
 
             <div className="space-y-6">
               {/* Header */}
@@ -355,22 +396,23 @@ export const Compare: React.FC = () => {
               </div>
 
               {/* Rows */}
-              {[
-                { label: 'Face', keys: ['face'] },
-                { label: 'Text', keys: ['title'] },
-                { label: 'Subject', keys: ['subject'] },
-                { label: 'Background', keys: ['bg'] },
-              ].map((row) => (
+              {([
+                { label: 'Faces', key: 'faces' },
+                { label: 'Text regions', key: 'texts' },
+                { label: 'Objects', key: 'objects' },
+              ] as const).map((row) => (
                 <div key={row.label} className="flex items-center border-b border-[#E6E4DE]/50 pb-4">
                   <div className="w-32 shrink-0 font-semibold text-[#121214]">{row.label}</div>
                   <div className="flex-1 grid gap-4" style={{ gridTemplateColumns: `repeat(${activeKeys.length}, minmax(0, 1fr))` }}>
                     {activeKeys.map((k, j) => {
-                      const val = mockVariants[k][row.keys[0] as keyof Variant] as number;
+                      const val = countFor(k, row.key);
+                      const total = totalFor(k);
+                      const percentage = total ? Math.round((val / total) * 100) : 0;
                       return (
                         <div key={k} className="flex flex-col gap-1">
-                          <span className="text-xs font-bold text-right text-[#4A4950]">{val}%</span>
+                          <span className="text-xs font-bold text-right text-[#4A4950]">{val} ({percentage}%)</span>
                           <div className="h-1.5 w-full bg-[#FAF9F5] rounded-full overflow-hidden flex justify-end">
-                            <div className={`comparison-bar h-full rounded-full ${j === 0 ? 'bg-[#8B5CF6]' : j === 1 ? 'bg-[#121214]' : 'bg-[#8F8D98]'}`} data-width={`${val}%`} style={{ width: '0%' }}></div>
+                            <div className={`comparison-bar h-full rounded-full ${j === 0 ? 'bg-[#8B5CF6]' : j === 1 ? 'bg-[#121214]' : 'bg-[#8F8D98]'}`} data-width={`${percentage}%`} style={{ width: '0%' }}></div>
                           </div>
                         </div>
                       );
@@ -390,8 +432,10 @@ export const Compare: React.FC = () => {
                   <Target className="w-5 h-5 text-[#8B5CF6]" />
                 </div>
                 <div>
-                  <span className="text-[10px] font-bold text-[#8F8D98] uppercase tracking-wider block mb-1">Face & Composition</span>
-                  <p className="text-sm font-medium text-[#121214]">Variant A gives the face stronger visual priority compared to Variant B.</p>
+                  <span className="text-[10px] font-bold text-[#8F8D98] uppercase tracking-wider block mb-1">Face detections</span>
+                  <p className="text-sm font-medium text-[#121214]">
+                    Variant A: {countFor('A', 'faces')} faces. Variant B: {countFor('B', 'faces')} faces.
+                  </p>
                 </div>
               </div>
               <div className="comparison-insight bg-white p-6 rounded-3xl border border-[#E6E4DE] flex gap-4 shadow-sm hover:shadow-md transition-shadow">
@@ -399,8 +443,10 @@ export const Compare: React.FC = () => {
                   <Zap className="w-5 h-5 text-[#121214]" />
                 </div>
                 <div>
-                  <span className="text-[10px] font-bold text-[#8F8D98] uppercase tracking-wider block mb-1">Typography</span>
-                  <p className="text-sm font-medium text-[#121214]">Variant B creates stronger headline prominence, drawing attention away from the subject.</p>
+                  <span className="text-[10px] font-bold text-[#8F8D98] uppercase tracking-wider block mb-1">Text detections</span>
+                  <p className="text-sm font-medium text-[#121214]">
+                    Variant A: {countFor('A', 'texts')} text regions. Variant B: {countFor('B', 'texts')} text regions.
+                  </p>
                 </div>
               </div>
             </div>
@@ -446,7 +492,13 @@ export const Compare: React.FC = () => {
                   <div className="pt-4 flex items-center justify-between border-t border-gray-800">
                     <span className="text-sm font-bold text-gray-300">Show Attention Overlay</span>
                     <label className="relative inline-flex items-center cursor-pointer">
-                      <input type="checkbox" className="sr-only peer" checked={showFeedHeatmap} onChange={() => setShowFeedHeatmap(!showFeedHeatmap)} />
+                      <input
+                        type="checkbox"
+                        className="sr-only peer"
+                        checked={showFeedHeatmap}
+                        disabled={!activeFeedAnalysis?.overlay_url}
+                        onChange={() => setShowFeedHeatmap(!showFeedHeatmap)}
+                      />
                       <div className="w-11 h-6 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-[#8B5CF6]"></div>
                     </label>
                   </div>
@@ -455,7 +507,9 @@ export const Compare: React.FC = () => {
                 <div className="mt-12 p-5 bg-gray-900 border border-gray-800 rounded-2xl">
                   <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">Attention Competition</h4>
                   <p className="text-sm text-gray-300 leading-relaxed">
-                    Your thumbnail has strong subject prominence but similar color intensity to neighboring thumbnails. Increase title contrast to preserve readability at smaller sizes.
+                    Variant {activeFeedVariant} has {countFor(activeFeedVariant, 'faces')} face,
+                    {' '}{countFor(activeFeedVariant, 'texts')} text-region, and
+                    {' '}{countFor(activeFeedVariant, 'objects')} object detections.
                   </p>
                 </div>
               </div>
@@ -483,12 +537,16 @@ export const Compare: React.FC = () => {
                   <div className="feed-item feed-target flex flex-col gap-3 relative">
                     <div className="absolute -inset-4 bg-[#8B5CF6]/10 border border-[#8B5CF6]/30 rounded-2xl -z-10 animate-pulse"></div>
                     <div className="relative aspect-video bg-gray-800 rounded-xl overflow-hidden shadow-2xl shadow-purple-900/20">
-                      <img src={mockVariants[activeFeedVariant].image} alt="Your Variant" className={`w-full h-full object-cover transition-all duration-500 ${activeFeedVariant === 'B' ? 'grayscale' : ''}`} />
-                      <span className="absolute bottom-2 right-2 bg-black/80 text-white text-[10px] font-bold px-1.5 py-0.5 rounded">8:42</span>
-
-                      {showFeedHeatmap && (
-                        <div className="absolute inset-0 mix-blend-screen opacity-90 transition-opacity duration-300" style={{ backgroundImage: `radial-gradient(circle at ${activeFeedVariant === 'A' ? '40% 30%' : '50% 50%'}, rgba(239,68,68,0.7) 0%, rgba(249,115,22,0.5) 20%, transparent 60%)` }}></div>
+                      {activeFeedAnalysis && (
+                        <img
+                          src={showFeedHeatmap && activeFeedAnalysis.overlay_url
+                            ? activeFeedAnalysis.overlay_url
+                            : activeFeedAnalysis.url}
+                          alt={`Your thumbnail variant ${activeFeedVariant}`}
+                          className="w-full h-full object-cover transition-all duration-500"
+                        />
                       )}
+                      <span className="absolute bottom-2 right-2 bg-black/80 text-white text-[10px] font-bold px-1.5 py-0.5 rounded">8:42</span>
 
                       <div className="absolute top-2 left-2 bg-[#8B5CF6] text-white text-[10px] font-black px-2 py-0.5 rounded uppercase shadow-sm">Your Thumbnail {activeFeedVariant}</div>
                     </div>
@@ -522,10 +580,14 @@ export const Compare: React.FC = () => {
 
             {/* Feed Metrics below */}
             <div className="feed-metrics mt-12 pt-8 border-t border-gray-800 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
-              {[{ l: 'Text Readability', v: '84%' }, { l: 'Subject Visibility', v: '91%' }, { l: 'Face Prominence', v: '78%' }, { l: 'Contrast', v: '88%' }, { l: 'Distinctiveness', v: '81%' }].map((m, i) => (
+              {[
+                { l: 'Text regions detected', v: countFor(activeFeedVariant, 'texts') },
+                { l: 'Faces detected', v: countFor(activeFeedVariant, 'faces') },
+                { l: 'Objects detected', v: countFor(activeFeedVariant, 'objects') },
+              ].map(m => (
                 <div key={m.l} className="feed-metric bg-gray-900 rounded-xl p-4 border border-gray-800">
                   <div className="text-[10px] font-bold text-gray-500 uppercase tracking-wider mb-1 line-clamp-1">{m.l}</div>
-                  <div className={`text-xl font-black ${i === 0 || i === 1 ? 'text-green-400' : 'text-white'}`}>{m.v}</div>
+                  <div className="text-xl font-black text-white">{m.v}</div>
                 </div>
               ))}
             </div>
@@ -537,16 +599,18 @@ export const Compare: React.FC = () => {
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-10">
               <div className="p-6 bg-[#FAF9F5] rounded-2xl border border-[#E6E4DE]">
-                <span className="block text-xs font-bold text-[#8F8D98] uppercase tracking-wider mb-2">Highest Attention Concentration</span>
-                <span className="block text-2xl font-black text-[#121214]">Variant C</span>
+                <span className="block text-xs font-bold text-[#8F8D98] uppercase tracking-wider mb-2">Variant A detections</span>
+                <span className="block text-2xl font-black text-[#121214]">{totalFor('A')}</span>
               </div>
               <div className="p-6 bg-[#FAF9F5] rounded-2xl border border-[#E6E4DE]">
-                <span className="block text-xs font-bold text-[#8F8D98] uppercase tracking-wider mb-2">Strongest Feed Readability</span>
-                <span className="block text-2xl font-black text-[#121214]">Variant A</span>
+                <span className="block text-xs font-bold text-[#8F8D98] uppercase tracking-wider mb-2">Variant B detections</span>
+                <span className="block text-2xl font-black text-[#121214]">{totalFor('B')}</span>
               </div>
               <div className="p-6 bg-[#FAF9F5] rounded-2xl border border-[#E6E4DE]">
-                <span className="block text-xs font-bold text-[#8F8D98] uppercase tracking-wider mb-2">Strongest Subject Prominence</span>
-                <span className="block text-2xl font-black text-[#121214]">Variant B</span>
+                <span className="block text-xs font-bold text-[#8F8D98] uppercase tracking-wider mb-2">More detected elements</span>
+                <span className="block text-2xl font-black text-[#121214]">
+                  {totalFor('A') === totalFor('B') ? 'Tie' : `Variant ${totalFor('A') > totalFor('B') ? 'A' : 'B'}`}
+                </span>
               </div>
             </div>
 

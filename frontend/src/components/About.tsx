@@ -214,17 +214,17 @@ export const About: React.FC = () => {
           
           {/* Back Thumbnail */}
           <div className="absolute top-10 right-10 w-64 aspect-video bg-gray-900 rounded-xl overflow-hidden shadow-2xl opacity-60 transform scale-90 -rotate-3 z-0">
-             <img src="/images/about_thumb2.jpg" alt="Thumb Back" className="w-full h-full object-cover grayscale opacity-50" />
+             <img src="https://i.pinimg.com/736x/d0/d7/d9/d0d7d91a4d433a48be7880aca5f3a85b.jpg" alt="Thumb Back" className="w-full h-full object-cover" />
           </div>
           
           {/* Middle Thumbnail */}
           <div className="absolute top-16 left-10 w-72 aspect-video bg-gray-800 rounded-xl overflow-hidden shadow-2xl opacity-80 transform scale-95 rotate-2 z-10">
-             <img src="/images/about_thumb2.jpg" alt="Thumb Mid" className="w-full h-full object-cover" />
+             <img src="https://i.pinimg.com/736x/e7/51/f9/e751f9acde6f6de5de6b5784e3d132dc.jpg" alt="Thumb Mid" className="w-full h-full object-cover" />
           </div>
           
           {/* Front Thumbnail */}
           <div className="absolute top-24 left-1/2 -translate-x-1/2 w-80 aspect-video bg-black rounded-xl overflow-hidden shadow-2xl z-20 border border-white/10 transform rotate-y-[-5deg]">
-             <img src="/images/about_thumb1.jpg" alt="Thumb Front" className="w-full h-full object-cover" />
+             <img src="https://i.pinimg.com/736x/1d/1f/cc/1d1fccc821ba9b38584b5ef421980645.jpg" alt="Thumb Front" className="w-full h-full object-cover" />
           </div>
 
           {/* Glassmorphism Attention Score Card */}

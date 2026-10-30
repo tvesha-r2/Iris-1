@@ -1,10 +1,39 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import gsap from 'gsap';
+import { useAuth } from '../context/AuthContext';
+import { getThumbnails } from '../lib/api';
 
 export const Hero: React.FC = () => {
   const containerRef = useRef<HTMLElement>(null);
   const leftColRef = useRef<HTMLDivElement>(null);
   const rightColRef = useRef<HTMLDivElement>(null);
+  const [savedThumbnail, setSavedThumbnail] = useState<{ token: string; url: string | null } | null>(null);
+  const [thumbnailLoadFailed, setThumbnailLoadFailed] = useState(false);
+  const { token } = useAuth();
+  const thumbnailUrl = token && savedThumbnail?.token === token ? savedThumbnail.url : null;
+
+  useEffect(() => {
+    if (!token) return;
+
+    let cancelled = false;
+    getThumbnails(token).then(thumbnails => {
+      if (cancelled) return;
+      const savedThumbnail = thumbnails.find(thumbnail => {
+        if (!thumbnail.url) return false;
+        try {
+          return new URL(thumbnail.url).protocol === 'https:';
+        } catch {
+          return false;
+        }
+      });
+      setSavedThumbnail({ token, url: savedThumbnail?.url ?? null });
+      setThumbnailLoadFailed(false);
+    }).catch(() => {
+      if (!cancelled) setSavedThumbnail({ token, url: null });
+    });
+
+    return () => { cancelled = true; };
+  }, [token]);
 
   useEffect(() => {
     const ctx = gsap.context(() => {
@@ -153,7 +182,14 @@ export const Hero: React.FC = () => {
                       <h3 className="text-sm font-bold text-black mb-4">Attention Heatmap</h3>
                       
                       <div className="relative aspect-video rounded-lg overflow-hidden bg-black shadow-sm mb-4 border border-gray-200">
-                        <img src="/images/dark_side_of_ai_thumb.jpg" alt="Thumbnail" className="absolute inset-0 w-full h-full object-cover" />
+                        {thumbnailUrl && !thumbnailLoadFailed && (
+                          <img
+                            src={thumbnailUrl}
+                            alt="Saved thumbnail"
+                            onError={() => setThumbnailLoadFailed(true)}
+                            className="absolute inset-0 w-full h-full object-cover"
+                          />
+                        )}
                         {/* CSS Heatmap Overlay for realism */}
                         <div className="absolute inset-0 mix-blend-screen opacity-90 pointer-events-none">
                           <div className="absolute top-1/3 left-1/3 w-32 h-32 bg-red-500 rounded-full blur-[40px]" />

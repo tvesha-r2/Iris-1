@@ -9,8 +9,8 @@ import {
 import gsap from 'gsap';
 import { AttentionBudget } from './AttentionBudget';
 import { ScrollTrigger } from 'gsap/ScrollTrigger';
-import { analyzeImage, generateAIInsights } from '../lib/api';
-import type { AnalysisResult } from '../lib/api';
+import { analyzeImage, generateAIInsights, getThumbnails, uploadImage } from '../lib/api';
+import type { AnalysisResult, StoredImage } from '../lib/api';
 
 gsap.registerPlugin(ScrollTrigger);
 
@@ -120,7 +120,9 @@ function ResultsView({
   onReset: () => void;
 }) {
   const [viewMode, setViewMode] = useState<ViewMode>('heatmap');
-  const displayUrl = viewMode === 'heatmap' && result.overlay_url ? result.overlay_url : localPreview;
+  const displayUrl = viewMode === 'heatmap' && result.overlay_url
+    ? result.overlay_url
+    : result.url || localPreview;
 
   return (
     <div className="relative flex flex-col items-center w-full gap-6">
@@ -231,6 +233,7 @@ export const Analyze: React.FC = () => {
   const [isDragging, setIsDragging]     = useState(false);
   const [localPreview, setLocalPreview] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [storedImage, setStoredImage] = useState<StoredImage | null>(null);
   const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
   const [analysisError, setAnalysisError]   = useState<string | null>(null);
   const [loadingStep, setLoadingStep]   = useState(0);
@@ -239,6 +242,7 @@ export const Analyze: React.FC = () => {
   const uploadZoneRef      = useRef<HTMLDivElement>(null);
   const resultsContainerRef = useRef<HTMLDivElement>(null);
   const stepTimerRef       = useRef<ReturnType<typeof setInterval> | null>(null);
+  const userInteractedRef  = useRef(false);
 
   const navigate = useNavigate();
   const { token, isAuthenticated } = useAuth();
@@ -252,6 +256,52 @@ export const Analyze: React.FC = () => {
     }, pageRef);
     return () => ctx.revert();
   }, []);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+
+    getThumbnails(token).then(thumbnails => {
+      if (cancelled || userInteractedRef.current) return;
+      const latest = thumbnails.find(thumbnail => thumbnail.url);
+      if (!latest) return;
+
+      const savedImage = {
+        id: latest.id,
+        url: latest.url,
+        filename: latest.filename,
+      };
+      setStoredImage(savedImage);
+      setLocalPreview(latest.url);
+
+      const scores = latest.ai_scores ?? {};
+      const hasAnalysis = latest.analysis_status === 'completed'
+        || Boolean(latest.overlay_url)
+        || Object.keys(scores).length > 0;
+      if (hasAnalysis) {
+        setAnalysisResult({
+          id: latest.id,
+          url: latest.url,
+          overlay_url: latest.overlay_url ?? null,
+          detections: latest.detections ?? {
+            texts: scores.texts_detected ?? 0,
+            faces: scores.faces_detected ?? 0,
+            objects: scores.objects_detected ?? 0,
+          },
+          insights: latest.insights ?? null,
+        });
+        setAppState('results');
+      } else {
+        setAppState('uploaded');
+      }
+    }).catch(error => {
+      if (!cancelled && !userInteractedRef.current) {
+        setAnalysisError(error instanceof Error ? error.message : 'Could not load saved thumbnails.');
+      }
+    });
+
+    return () => { cancelled = true; };
+  }, [token]);
 
   // Clean up object URL on unmount
   useEffect(() => {
@@ -274,6 +324,7 @@ export const Analyze: React.FC = () => {
   };
 
   const handleFile = (file: File) => {
+    userInteractedRef.current = true;
     // Validate image type
     const validTypes = ['image/png', 'image/jpeg', 'image/webp'];
     if (!validTypes.includes(file.type)) {
@@ -288,6 +339,7 @@ export const Analyze: React.FC = () => {
 
     setAnalysisError(null);
     setAnalysisResult(null);
+    setStoredImage(null);
 
     if (localPreview?.startsWith('blob:')) URL.revokeObjectURL(localPreview);
     const preview = URL.createObjectURL(file);
@@ -306,9 +358,11 @@ export const Analyze: React.FC = () => {
   };
 
   const loadSample = () => {
+    userInteractedRef.current = true;
     const sampleUrl = 'https://images.unsplash.com/photo-1611162617474-5b21e879e113?ixlib=rb-4.0.3&auto=format&fit=crop&w=1280&q=80';
     setLocalPreview(sampleUrl);
     setSelectedFile(null); // sample is URL-only, not a File
+    setStoredImage(null);
 
     gsap.to('.upload-zone', {
       opacity: 0, scale: 0.95, duration: 0.4,
@@ -323,7 +377,7 @@ export const Analyze: React.FC = () => {
 
   // ── Real analysis call ─────────────────────────────────────────────────
   const startAnalysis = async () => {
-    if (!selectedFile) {
+    if (!selectedFile && !storedImage) {
       setAnalysisError('Please select a real image file to analyse (sample URLs cannot be sent to the backend).');
       return;
     }
@@ -350,7 +404,16 @@ export const Analyze: React.FC = () => {
     );
 
     try {
-      const result = await analyzeImage(selectedFile, token);
+      let imageReference = storedImage;
+      if (!imageReference && selectedFile) {
+        imageReference = await uploadImage(selectedFile, token);
+        setStoredImage(imageReference);
+      }
+      if (!imageReference) {
+        throw new Error('The image has not been stored yet. Please select it again and retry.');
+      }
+
+      const result = await analyzeImage(imageReference.id, token);
       clearInterval(stepTimerRef.current!);
 
       setAnalysisResult(result);
@@ -384,6 +447,7 @@ export const Analyze: React.FC = () => {
           if (localPreview?.startsWith('blob:')) URL.revokeObjectURL(localPreview);
           setLocalPreview(null);
           setSelectedFile(null);
+          setStoredImage(null);
           setAnalysisResult(null);
           setAnalysisError(null);
           setAppState('empty');
@@ -392,6 +456,7 @@ export const Analyze: React.FC = () => {
     } else {
       setLocalPreview(null);
       setSelectedFile(null);
+      setStoredImage(null);
       setAnalysisResult(null);
       setAnalysisError(null);
       setAppState('empty');
@@ -483,29 +548,37 @@ export const Analyze: React.FC = () => {
               <div className="flex flex-col sm:flex-row items-center justify-between mt-6 px-2 gap-4">
                 <div className="flex flex-col">
                   <span className="text-sm font-bold text-[#121214]">
-                    {selectedFile ? selectedFile.name : 'sample-thumbnail.jpg'}
+                    {selectedFile?.name ?? storedImage?.filename ?? 'sample-thumbnail.jpg'}
                   </span>
                   <span className="text-xs text-[#8F8D98] font-medium">
                     {selectedFile
                       ? `${(selectedFile.size / 1024).toFixed(0)} KB`
-                      : 'Sample image · click Analyse to use a real file'}
+                      : storedImage
+                        ? 'Saved image · click Analyse to continue'
+                        : 'Sample image · click Analyse to use a real file'}
                   </span>
                 </div>
 
                 <div className="flex items-center gap-3">
                   <button
-                    onClick={() => { setAppState('empty'); setAnalysisError(null); }}
+                    onClick={() => {
+                      setAppState('empty');
+                      setAnalysisError(null);
+                      setLocalPreview(null);
+                      setSelectedFile(null);
+                      setStoredImage(null);
+                    }}
                     className="px-4 py-2 text-sm font-semibold text-[#4A4950] hover:text-[#121214] hover:bg-[#FAF9F5] rounded-xl transition-colors"
                   >
                     Remove
                   </button>
                   <button
                     onClick={startAnalysis}
-                    disabled={!selectedFile}
+                    disabled={!selectedFile && !storedImage}
                     className="inline-flex items-center gap-2 px-6 py-2.5 text-sm font-semibold text-white
                       bg-[#8B5CF6] hover:bg-[#7C3AED] rounded-xl transition-colors shadow-md shadow-purple-500/20
                       disabled:opacity-50 disabled:cursor-not-allowed"
-                    title={!selectedFile ? 'Upload a real image file to analyse' : 'Analyse thumbnail'}
+                    title={!selectedFile && !storedImage ? 'Upload a real image file to analyse' : 'Analyse thumbnail'}
                   >
                     <Activity className="w-4 h-4" />
                     Analyse Thumbnail
@@ -513,7 +586,7 @@ export const Analyze: React.FC = () => {
                 </div>
               </div>
 
-              {!selectedFile && (
+              {!selectedFile && !storedImage && (
                 <p className="mt-3 text-xs text-[#8F8D98] text-center">
                   Sample thumbnails can be previewed but must be uploaded as a file to run analysis.
                 </p>
@@ -595,7 +668,7 @@ export const Analyze: React.FC = () => {
               <div className="w-full">
                 <AttentionBudget
                   isEmbedded={true}
-                  imageUrl={localPreview || undefined}
+                  imageUrl={analysisResult.url || localPreview || undefined}
                   overlayUrl={analysisResult.overlay_url}
                   insights={analysisResult.insights}
                 />

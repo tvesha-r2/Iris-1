@@ -16,13 +16,18 @@ User uploads image (Analyze.tsx)
   ├─ User clicks "Analyse Thumbnail"
   │
   ▼
-POST /api/analyze  (with JWT)
+POST /api/upload  (with JWT)
   │
   ├─ Backend: upload original → Cloudinary
+  └─ Backend: save Cloudinary URL → MongoDB; return { id, url }
+  │
+  ▼
+POST /api/analyze with thumbnail_id  (with JWT)
+  │
+  ├─ Backend: retrieve that user's stored image from Cloudinary
   ├─ Backend: ML pipeline (TranSalNet → PaddleOCR → YuNet → YOLO → Fusion)
   ├─ Backend: upload heatmap overlay → Cloudinary
-  ├─ Backend: store metadata → MongoDB
-  ├─ Backend: optional Groq AI insights
+  └─ Backend: update analysis metadata → MongoDB
   │
   ▼
 Response: { id, url, overlay_url, detections, insights }
@@ -43,7 +48,8 @@ POST /api/analyze
 **Authentication:** `Authorization: Bearer <jwt>`
 
 **Request:** `multipart/form-data`  
-- `file` — image file (PNG, JPG, WEBP)
+- `thumbnail_id` — ID returned by `POST /api/upload`
+- `file` — image file (PNG, JPG, WEBP); retained for compatibility with existing clients
 
 **Response:**
 ```json
@@ -93,9 +99,13 @@ POST /api/analyze
 
 ---
 
-## Cloudinary
+## Image storage and refresh
 
-- **Original** uploaded in `/api/analyze` before ML runs
+- **Original** is stored in `/api/upload` before analysis starts
+- The MongoDB thumbnail record contains the original `cloudinary_url` and is
+  returned from `GET /api/thumbnails` as both `url` and `cloudinary_url`
+- The Analyze page restores the latest saved image/result from this endpoint
+- If analysis fails, the uploaded image remains stored and can be retried by ID
 - **Overlay** uploaded after ML inference (non-fatal if fails — `overlay_url` becomes `null`)
 - Frontend consumes returned Cloudinary URLs — no direct frontend→Cloudinary upload
 

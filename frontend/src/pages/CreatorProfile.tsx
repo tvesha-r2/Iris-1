@@ -3,8 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { AppNavbar } from "../components/AppNavbar";
 import { useAuth } from "../context/AuthContext";
 import { Check, Loader2, Save, ArrowLeft, User } from "lucide-react";
-
-const API_BASE = "http://localhost:8000";
+import { API_BASE } from "../lib/api";
 
 const CATEGORIES = [
   "Education", "Gaming", "Tech & Science", "Entertainment",

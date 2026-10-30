@@ -4,9 +4,9 @@
 
 ### `POST /api/analyze`
 
-Runs the complete 8-channel saliency fusion pipeline on an uploaded thumbnail
-and returns Cloudinary URLs for both the original image and the generated
-attention heatmap overlay.
+Runs the complete 8-channel saliency fusion pipeline on a thumbnail already
+stored by `POST /api/upload` and returns Cloudinary URLs for the original image
+and generated attention heatmap overlay.
 
 **Authentication**: Bearer JWT (same token issued by `/auth/login`).
 
@@ -19,8 +19,31 @@ POST /api/analyze
 Authorization: Bearer <jwt_token>
 Content-Type: multipart/form-data
 
-file=<image file>          # JPEG or PNG thumbnail
+thumbnail_id=<MongoDB id>  # returned by POST /api/upload
 ```
+
+For compatibility, the endpoint still accepts `file=<image file>` instead.
+That path stores the original before running inference. Provide exactly one of
+`thumbnail_id` or `file`.
+
+### Persist the image
+
+`POST /api/upload` accepts `file=<image file>` and returns the stored MongoDB
+ID and Cloudinary URL:
+
+```json
+{
+  "id": "mongo_document_id",
+  "url": "https://res.cloudinary.com/.../Thumbheat/image.jpg"
+}
+```
+
+### Restore saved images
+
+`GET /api/thumbnails` returns the authenticated user's stored thumbnails,
+including the persistent `url`, `cloudinary_url`, `overlay_url`, and analysis
+metadata. The Analyze page uses this endpoint to restore the most recent image
+after a refresh.
 
 ---
 
@@ -57,20 +80,18 @@ file=<image file>          # JPEG or PNG thumbnail
 | 400 | Empty file |
 | 401 | Missing or invalid JWT |
 | 422 | Invalid / corrupt image |
-| 502 | Cloudinary upload failure |
-| 503 | ML model unavailable (checkpoint missing) |
+| 502 | Cloudinary upload or stored-image retrieval failure |
+| 503 | Cloudinary configuration missing/placeholder or ML models unavailable |
 | 500 | Internal inference or storage failure |
 
-All error bodies: `{ "detail": "human-readable description" }`. No stack traces or secrets are exposed.
+All error bodies: `{ "detail": "human-readable description" }`. No stack traces or secrets are exposed. Configure `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` in `backend/.env` with the values from the Cloudinary dashboard; placeholder values are rejected before uploading.
 
 ---
 
 ## Inference Pipeline
 
 ```
-Upload bytes
-    │
-    ├─ Cloudinary upload ──────────────────────────────────────► original_url
+Load saved image by thumbnail_id
     │
     ├─[ch 0] TranSalNet-Res ──────────────────────────────────── base_heatmap
     ├─[ch 1] PaddleOCR + text_map.py ────────────────────────── text_map
